@@ -108,10 +108,11 @@ __global__ void compute_grad_v_kernel(const T* attn_weights,
         int seq_kv           = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
         int q_storage_offset = cu_seqlens_q_padded[batch_idx]; // seq_q_idx == 0
 
-        // Load attn_weights for this position (workspace is batch-strided)
+        // attn_weights layout: [total_padded_q, head_num, max_seq_kv]
+        int attn_offset = (q_storage_offset * Config::head_num + head_idx) * max_seq_kv;
 #pragma unroll
         for(int i = 0; i < max_seq_kv; i++)
-            attn[i] = attn_weights[cur_idx * max_seq_kv + i];
+            attn[i] = attn_weights[attn_offset + i];
 
         // Compute grad_V = attn_weights^T @ grad_O
         for(int j = 0; j < seq_kv; j++)
@@ -186,16 +187,10 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
         if(batch_idx >= Config::bs)
             continue;
 
-        // Skip batches where actual Q seq is 0.
+        // Skip batches where actual Q seq is 0 — no row exists in workspace for them.
         int actual_seq_q = cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx];
         if(actual_seq_q == 0)
-        {
-            // Zero out the workspace row so softmax_backward_kernel sees clean data.
-            T* grad_attn_ptr = (T*)&grad_attn[cur_batch_idx * max_seq_kv];
-            for(int i = 0; i < max_seq_kv; i++)
-                grad_attn_ptr[i] = T(0.0f);
             continue;
-        }
 
         int seq_kv           = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
         int q_storage_offset = cu_seqlens_q_padded[batch_idx]; // seq_idx == 0
@@ -212,7 +207,8 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
             &V[cu_seqlens_kv_padded[batch_idx] * Config::head_num * head_dim + head_idx * head_dim];
         int V_stride = Config::head_num * head_dim;
 
-        T* grad_attn_ptr = (T*)&grad_attn[cur_batch_idx * max_seq_kv];
+        // workspace layout: [total_padded_q, head_num, max_seq_kv]
+        T* grad_attn_ptr = (T*)&grad_attn[(q_storage_offset * Config::head_num + head_idx) * max_seq_kv];
 
         uint4 ls_dwordx4_tmp_var;
 
@@ -302,24 +298,27 @@ __global__ void compute_grad_attn_kernel(const T* grad_O,
     }
 }
 
-// Kernel 3: Apply softmax backward and mask
+// softmax_backward_kernel
+//
+// grad_attn / attn_weights layout: [total_padded_q, head_num, max_seq_kv]
+// Empty-Q batches have no row in this buffer (kernel 2 skips them).
+// padded_q_to_batch[padded_q_slot] -> batch_idx  (host-precomputed)
 template <typename T, typename Config>
 __global__ void softmax_backward_kernel(const T* attn_weights,
                                         const T* dropout_mask,
                                         T* grad_attn,
                                         float dropout_scale,
-                                        const int* cu_seqlens_q,
-                                        const int* cu_seqlens_kv)
+                                        const int* cu_seqlens_kv,
+                                        const int* padded_q_to_batch,
+                                        uint32_t total_elt)
 {
     const uint32_t block_id          = blockIdx.x;
     const uint32_t thread_id         = threadIdx.x;
-    constexpr int seq_q              = Config::seq_q;
     constexpr int max_seq_kv         = Config::max_seq_kv;
     constexpr int block_size         = Config::step2_block_size;
-    constexpr int per_grad_attn_size = seq_q * max_seq_kv;
+    constexpr int per_grad_attn_size = max_seq_kv; // seq_q == 1
     constexpr int valid_thread_range = block_size / per_grad_attn_size * per_grad_attn_size;
     const uint32_t cur_block_offset  = block_id * valid_thread_range + thread_id;
-    constexpr uint32_t total_elt     = Config::bs * Config::head_num * seq_q * max_seq_kv;
     bool is_tail                     = block_id * valid_thread_range + block_size >= total_elt;
     int real_row_num = is_tail ? (total_elt - block_id * valid_thread_range) / max_seq_kv
                                : valid_thread_range / max_seq_kv;
@@ -330,17 +329,14 @@ __global__ void softmax_backward_kernel(const T* attn_weights,
         constexpr int row_num = valid_thread_range / max_seq_kv;
         __shared__ T reduce_grad_score[row_num];
 
+        // [total_padded_q, head_num, max_seq_kv] flat layout
         int global_row_idx = cur_block_offset / max_seq_kv;
-        int batch_idx      = global_row_idx / (Config::seq_q * Config::head_num);
+        int padded_q_slot  = global_row_idx / Config::head_num;
         int k_idx          = cur_block_offset % max_seq_kv;
 
-        int seq_kv = (batch_idx < Config::bs)
-                         ? (cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx])
-                         : max_seq_kv;
-
-        // For empty-Q batches: grad_attn was zeroed by kernel 2, so grad_score = 0.
-        bool q_is_empty = (batch_idx < Config::bs) &&
-                          (cu_seqlens_q[batch_idx + 1] - cu_seqlens_q[batch_idx] == 0);
+        // All rows in the buffer belong to active batches (empty-Q batches have no row).
+        int batch_idx = padded_q_to_batch[padded_q_slot];
+        int seq_kv    = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
 
         T grad_attn_value = grad_attn[cur_block_offset];
         if constexpr(Config::enable_dropout_mask)
@@ -348,7 +344,7 @@ __global__ void softmax_backward_kernel(const T* attn_weights,
             grad_attn_value = grad_attn_value * dropout_mask[cur_block_offset] * dropout_scale;
         }
         T attn_weight             = attn_weights[cur_block_offset];
-        T grad_score              = q_is_empty ? T(0.0f) : grad_attn_value * attn_weight;
+        T grad_score              = grad_attn_value * attn_weight;
         tmp_grad_score[thread_id] = grad_score;
         __syncthreads();
 
@@ -358,43 +354,29 @@ __global__ void softmax_backward_kernel(const T* attn_weights,
             T sum = T(0.0f);
 #pragma unroll
             for(int i = 0; i < max_seq_kv; i++)
-            {
                 sum += tmp_grad_score[thread_id * max_seq_kv + i];
-            }
             reduce_grad_score[thread_id] = sum;
         }
         __syncthreads();
 
         grad_score -= attn_weight * reduce_grad_score[thread_id / max_seq_kv];
 
-        // Zero out for empty-Q batches (kernel 2 already zeroed grad_attn, but be safe)
-        if(q_is_empty)
+        // Apply causal mask and KV-padding mask
+        if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
         {
-            grad_score = T(0.0f);
-        }
-        // Apply causal mask and padding mask
-        else if constexpr(Config::mask_type == CausalMaskType::TOP_LEFT)
-        {
-            int q_idx = (cur_block_offset % (seq_q * max_seq_kv)) / max_seq_kv;
-            if(k_idx > q_idx || k_idx >= seq_kv)
-            {
+            // q_idx == 0; mask: k_idx > 0 || k_idx >= seq_kv
+            if(k_idx > 0 || k_idx >= seq_kv)
                 grad_score = T(0.0f);
-            }
         }
         else if constexpr(Config::mask_type == CausalMaskType::BOTTOM_RIGHT)
         {
-            int q_idx = (cur_block_offset % (seq_q * max_seq_kv)) / max_seq_kv;
-            if(k_idx < q_idx || k_idx >= seq_kv)
-            {
+            if(k_idx >= seq_kv)
                 grad_score = T(0.0f);
-            }
         }
         else
         {
             if(k_idx >= seq_kv)
-            {
                 grad_score = T(0.0f);
-            }
         }
 
         grad_attn[cur_block_offset] = grad_score;
@@ -452,10 +434,11 @@ __global__ void compute_grad_qk_kernel(const T* grad_scores,
         int seq_kv           = cu_seqlens_kv[batch_idx + 1] - cu_seqlens_kv[batch_idx];
         int q_storage_offset = cu_seqlens_q_padded[batch_idx]; // seq_q_idx == 0
 
-        // Load grad_scores for this position (workspace is batch-strided)
+        // workspace layout: [total_padded_q, head_num, max_seq_kv]
+        int gs_offset = (q_storage_offset * Config::head_num + head_idx) * max_seq_kv;
 #pragma unroll
         for(int i = 0; i < max_seq_kv; i++)
-            grad_score_vals[i] = grad_scores[cur_idx * max_seq_kv + i];
+            grad_score_vals[i] = grad_scores[gs_offset + i];
 
         // Compute grad_Q = grad_scores @ K * scale
         uint4 store_dwordx4_tmp_var[block_k / dwordx4_load_elt];
@@ -530,15 +513,12 @@ template <typename T, typename Config>
 struct AttnBackwardKernelLauncher
 {
 
-    static size_t calc_workspace_size()
+    static size_t calc_workspace_size(int total_padded_q)
     {
-        constexpr int bs         = Config::bs;
         constexpr int head_num   = Config::head_num;
-        constexpr int seq_q      = Config::seq_q;
         constexpr int max_seq_kv = Config::max_seq_kv;
-
-        size_t workspace_size = bs * head_num * seq_q * max_seq_kv * sizeof(T);
-        return workspace_size;
+        // workspace layout: [total_padded_q, head_num, max_seq_kv]
+        return (size_t)total_padded_q * head_num * max_seq_kv * sizeof(T);
     }
 
     static void run_attn_bwd_kernel(const T* Q,
@@ -556,7 +536,9 @@ struct AttnBackwardKernelLauncher
                                     const int* cu_seqlens_q,
                                     const int* cu_seqlens_q_padded,
                                     const int* cu_seqlens_kv,
-                                    const int* cu_seqlens_kv_padded)
+                                    const int* cu_seqlens_kv_padded,
+                                    const int* padded_q_to_batch,
+                                    int total_padded_q)
     {
         constexpr int bs         = Config::bs;
         constexpr int head_num   = Config::head_num;
@@ -571,14 +553,14 @@ struct AttnBackwardKernelLauncher
 
         dim3 block(warp_size);
 
-        // Step 1: Compute grad_V = attn_weights^T @ grad_O
+        // Step 1: Compute grad_V = attn_weights^T @ grad_O — grid covers all (bs * head_num) tasks
         constexpr int tasks_per_block_v = 16;
         dim3 grid_v((bs * seq_q * head_num + tasks_per_block_v - 1) / tasks_per_block_v);
         compute_grad_v_kernel<T, Config, tasks_per_block_v><<<grid_v, block>>>(
             attn_weights, grad_O, grad_V, cu_seqlens_q, cu_seqlens_q_padded, cu_seqlens_kv,
             cu_seqlens_kv_padded);
 
-        // Step 2: Compute grad_attn = grad_O @ V^T
+        // Step 2: Compute grad_attn = grad_O @ V^T — grid covers all (bs * head_num) tasks
         constexpr int tasks_per_block_attn  = 16;
         constexpr int process_head_per_warp = warp_size / (head_dim / 64);
         dim3 grid_grad_attn(
@@ -588,15 +570,16 @@ struct AttnBackwardKernelLauncher
             grad_O, V, workspace, cu_seqlens_q, cu_seqlens_q_padded, cu_seqlens_kv,
             cu_seqlens_kv_padded);
 
-        // Step 3: Apply softmax backward and mask
-        constexpr int work_thread_num =
-            Config::step2_block_size / (seq_q * max_seq_kv) * (seq_q * max_seq_kv);
-        dim3 grid_softmax((merge_bs * seq_q * max_seq_kv + work_thread_num - 1) / work_thread_num);
+        // Step 3: Softmax backward — grid covers [total_padded_q, head_num, max_seq_kv] elements
+        constexpr int work_thread_num = Config::step2_block_size / max_seq_kv * max_seq_kv;
+        uint32_t total_elt = (uint32_t)total_padded_q * head_num * max_seq_kv;
+        dim3 grid_softmax((total_elt + work_thread_num - 1) / work_thread_num);
         dim3 block_softmax(Config::step2_block_size);
         softmax_backward_kernel<T, Config><<<grid_softmax, block_softmax>>>(
-            attn_weights, dropout_mask, workspace, dropout_scale, cu_seqlens_q, cu_seqlens_kv);
+            attn_weights, dropout_mask, workspace, dropout_scale, cu_seqlens_kv,
+            padded_q_to_batch, total_elt);
 
-        // Step 4: Compute grad_Q and grad_K
+        // Step 4: Compute grad_Q and grad_K — grid covers all (bs * head_num) tasks
         constexpr int tasks_per_block_qk = 4;
         dim3 grid_qk((bs * seq_q * head_num + tasks_per_block_qk - 1) / tasks_per_block_qk);
         compute_grad_qk_kernel<T, Config, tasks_per_block_qk><<<grid_qk, block>>>(
@@ -716,10 +699,10 @@ void attn_backward(const T* Q,
         for(int h = 0; h < head_num; h++)
         {
             // Q/grad_O/grad_Q: [total_padded_seq_q, head_num, head_dim]
-            int offset_Q      = (q_off * head_num + h) * head_dim;
-            // attn_weights/dropout_mask: [bs, head_num, max_kv_seq] (batch-strided)
-            int offset_attn   = (b * head_num + h) * max_kv_seq;
-            int offset_drop   = dropout_mask ? (b * head_num + h) * max_kv_seq : 0;
+            int offset_Q    = (q_off * head_num + h) * head_dim;
+            // attn_weights/dropout_mask: [total_padded_q, head_num, max_kv_seq]
+            int offset_attn = (q_off * head_num + h) * max_kv_seq;
+            int offset_drop = dropout_mask ? (q_off * head_num + h) * max_kv_seq : 0;
 
             const T* Q_bh       = Q + offset_Q;
             const T* grad_O_bh  = grad_O + offset_Q; // same offset as Q
@@ -836,19 +819,29 @@ void test_run_attn_bwd_kernel(
     std::bernoulli_distribution q_present_dis(0.5);
 
     // --- Generate cu_seqlens_q / cu_seqlens_q_padded ---
-    // actual Q seq per batch is 0 or 1; padded slot is always 1 per batch.
+    // Actual Q seq per batch is 0 or 1.
+    // Padded storage only advances by 1 for active batches (same as actual in this scheme).
     std::vector<int> h_cu_seqlens_q(bs + 1);
     std::vector<int> h_cu_seqlens_q_padded(bs + 1);
     h_cu_seqlens_q[0]        = 0;
     h_cu_seqlens_q_padded[0] = 0;
-    int total_actual_q   = 0;
-    int total_padded_q   = bs; // always 1 slot per batch
+    int total_actual_q = 0;
     for(int b = 0; b < bs; b++)
     {
         int actual_q = q_present_dis(gen) ? 1 : 0;
         total_actual_q += actual_q;
         h_cu_seqlens_q[b + 1]        = total_actual_q;
-        h_cu_seqlens_q_padded[b + 1] = b + 1; // cu_seqlens_q_padded[b] == b
+        // Only allocate a padded slot for active batches.
+        h_cu_seqlens_q_padded[b + 1] = h_cu_seqlens_q_padded[b] + actual_q;
+    }
+    int total_padded_q = h_cu_seqlens_q_padded[bs]; // == total_actual_q in this scheme
+
+    // Build padded_q_to_batch reverse map (host-side, size = total_padded_q)
+    std::vector<int> h_padded_q_to_batch(total_padded_q);
+    for(int b = 0; b < bs; b++)
+    {
+        if(h_cu_seqlens_q_padded[b + 1] > h_cu_seqlens_q_padded[b])
+            h_padded_q_to_batch[h_cu_seqlens_q_padded[b]] = b;
     }
 
     // --- Generate cu_seqlens_kv / cu_seqlens_kv_padded ---
@@ -871,14 +864,14 @@ void test_run_attn_bwd_kernel(
     }
 
     // --- Buffer sizes ---
-    // Q/grad_O/grad_Q: [total_padded_q, head_num, head_dim]  (total_padded_q == bs)
-    // attn_weights/dropout_mask: [bs, head_num, max_seq_kv]  (batch-strided, no Q padding)
+    // Q/grad_O/grad_Q: [total_padded_q, head_num, head_dim]
+    // attn_weights/dropout_mask: [total_padded_q, head_num, max_seq_kv]
     size_t size_Q            = (size_t)total_padded_q * head_num * head_dim;
     size_t size_K            = (size_t)total_padded_kv_seq * head_num * head_dim;
     size_t size_V            = (size_t)total_padded_kv_seq * head_num * head_dim;
     size_t size_grad_O       = (size_t)total_padded_q * head_num * head_dim;
-    size_t size_attn_weights = (size_t)bs * head_num * max_seq_kv;
-    size_t size_dropout_mask = (size_t)bs * head_num * max_seq_kv;
+    size_t size_attn_weights = (size_t)total_padded_q * head_num * max_seq_kv;
+    size_t size_dropout_mask = (size_t)total_padded_q * head_num * max_seq_kv;
 
     // Allocate host memory
     std::vector<DataType> h_Q(size_Q, DataType(0.0f));
@@ -932,22 +925,17 @@ void test_run_attn_bwd_kernel(
         }
     }
 
-    // --- Initialize attention weights (batch-strided: [bs, head_num, max_seq_kv]) ---
-    // Only meaningful for active-Q batches; zero-out for empty-Q batches.
+    // attn_weights layout: [total_padded_q, head_num, max_seq_kv] — only active-Q batches.
     for(int b = 0; b < bs; b++)
     {
         int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
-        int kv_seq   = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
+        if(actual_q == 0)
+            continue; // empty-Q batches have no row in this buffer
+        int kv_seq = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
+        int q_off  = h_cu_seqlens_q_padded[b];
         for(int h = 0; h < head_num; h++)
         {
-            int base = (b * head_num + h) * max_seq_kv;
-            if(actual_q == 0)
-            {
-                // kernel will zero this row; CPU ref skips it; just zero here
-                for(int j = 0; j < max_seq_kv; j++)
-                    h_attn_weights[base + j] = DataType(0.0f);
-                continue;
-            }
+            int base = (q_off * head_num + h) * max_seq_kv;
             // Normalized random softmax output
             float sum = 0.0f;
             for(int j = 0; j < kv_seq; j++)
@@ -964,7 +952,7 @@ void test_run_attn_bwd_kernel(
         }
     }
 
-    // --- Initialize dropout mask (batch-strided: [bs, head_num, max_seq_kv]) ---
+    // --- Initialize dropout mask: [total_padded_q, head_num, max_seq_kv] ---
     for(size_t i = 0; i < size_dropout_mask; i++)
     {
         h_dropout_mask[i] = Config::enable_dropout_mask
@@ -1003,38 +991,43 @@ void test_run_attn_bwd_kernel(
     DataType *d_grad_Q, *d_grad_K, *d_grad_V, *d_workspace;
     int *d_cu_seqlens_q, *d_cu_seqlens_q_padded;
     int *d_cu_seqlens_kv, *d_cu_seqlens_kv_padded;
+    int* d_padded_q_to_batch;
 
-    HIP_CHECK(hipMalloc(&d_Q, size_Q * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_Q, size_Q > 0 ? size_Q * sizeof(DataType) : 1));
     HIP_CHECK(hipMalloc(&d_K, size_K * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask * sizeof(DataType)));
-    HIP_CHECK(hipMalloc(&d_grad_Q, size_Q * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O > 0 ? size_grad_O * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_attn_weights, size_attn_weights > 0 ? size_attn_weights * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_dropout_mask, size_dropout_mask > 0 ? size_dropout_mask * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_grad_Q, size_Q > 0 ? size_Q * sizeof(DataType) : 1));
     HIP_CHECK(hipMalloc(&d_grad_K, size_K * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_grad_V, size_V * sizeof(DataType)));
     HIP_CHECK(hipMalloc(&d_cu_seqlens_q, (bs + 1) * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_cu_seqlens_q_padded, (bs + 1) * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_cu_seqlens_kv, (bs + 1) * sizeof(int)));
     HIP_CHECK(hipMalloc(&d_cu_seqlens_kv_padded, (bs + 1) * sizeof(int)));
+    if(total_padded_q > 0)
+        HIP_CHECK(hipMalloc(&d_padded_q_to_batch, total_padded_q * sizeof(int)));
+    else
+        d_padded_q_to_batch = nullptr;
 
-    size_t workspace_size = Launcher::calc_workspace_size();
-    HIP_CHECK(hipMalloc(&d_workspace, workspace_size));
+    // workspace: [total_padded_q, head_num, max_seq_kv]
+    size_t workspace_size = Launcher::calc_workspace_size(total_padded_q);
+    HIP_CHECK(hipMalloc(&d_workspace, workspace_size > 0 ? workspace_size : 1));
 
     // --- Copy to device ---
-    HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), size_Q * sizeof(DataType), hipMemcpyHostToDevice));
+    if(size_Q > 0)
+        HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), size_Q * sizeof(DataType), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_K, h_K.data(), size_K * sizeof(DataType), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_V, h_V.data(), size_V * sizeof(DataType), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(
-        d_grad_O, h_grad_O.data(), size_grad_O * sizeof(DataType), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_attn_weights,
-                        h_attn_weights.data(),
-                        size_attn_weights * sizeof(DataType),
-                        hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_dropout_mask,
-                        h_dropout_mask.data(),
-                        size_dropout_mask * sizeof(DataType),
-                        hipMemcpyHostToDevice));
+    if(size_grad_O > 0)
+        HIP_CHECK(hipMemcpy(d_grad_O, h_grad_O.data(), size_grad_O * sizeof(DataType), hipMemcpyHostToDevice));
+    if(size_attn_weights > 0)
+        HIP_CHECK(hipMemcpy(d_attn_weights, h_attn_weights.data(),
+                            size_attn_weights * sizeof(DataType), hipMemcpyHostToDevice));
+    if(size_dropout_mask > 0)
+        HIP_CHECK(hipMemcpy(d_dropout_mask, h_dropout_mask.data(),
+                            size_dropout_mask * sizeof(DataType), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(
         d_cu_seqlens_q, h_cu_seqlens_q.data(), (bs + 1) * sizeof(int), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_cu_seqlens_q_padded,
@@ -1047,28 +1040,24 @@ void test_run_attn_bwd_kernel(
                         h_cu_seqlens_kv_padded.data(),
                         (bs + 1) * sizeof(int),
                         hipMemcpyHostToDevice));
+    if(total_padded_q > 0)
+        HIP_CHECK(hipMemcpy(d_padded_q_to_batch, h_padded_q_to_batch.data(),
+                            total_padded_q * sizeof(int), hipMemcpyHostToDevice));
+
+    auto bwd_launch = [&]() {
+        Launcher::run_attn_bwd_kernel(d_Q, d_K, d_V, d_grad_O, d_attn_weights,
+                                      Config::enable_dropout_mask ? d_dropout_mask
+                                                                  : static_cast<DataType*>(nullptr),
+                                      dropout_p, sqr_dk_scale,
+                                      d_grad_Q, d_grad_K, d_grad_V, d_workspace,
+                                      d_cu_seqlens_q, d_cu_seqlens_q_padded,
+                                      d_cu_seqlens_kv, d_cu_seqlens_kv_padded,
+                                      d_padded_q_to_batch, total_padded_q);
+    };
 
     // --- Warmup runs ---
     for(int i = 0; i < warmup_iters; i++)
-    {
-        Launcher::run_attn_bwd_kernel(d_Q,
-                                      d_K,
-                                      d_V,
-                                      d_grad_O,
-                                      d_attn_weights,
-                                      Config::enable_dropout_mask ? d_dropout_mask
-                                                                  : static_cast<DataType*>(nullptr),
-                                      dropout_p,
-                                      sqr_dk_scale,
-                                      d_grad_Q,
-                                      d_grad_K,
-                                      d_grad_V,
-                                      d_workspace,
-                                      d_cu_seqlens_q,
-                                      d_cu_seqlens_q_padded,
-                                      d_cu_seqlens_kv,
-                                      d_cu_seqlens_kv_padded);
-    }
+        bwd_launch();
     HIP_CHECK(hipDeviceSynchronize());
 
     // --- Timed runs ---
@@ -1078,25 +1067,7 @@ void test_run_attn_bwd_kernel(
 
     HIP_CHECK(hipEventRecord(start));
     for(int i = 0; i < test_iters; i++)
-    {
-        Launcher::run_attn_bwd_kernel(d_Q,
-                                      d_K,
-                                      d_V,
-                                      d_grad_O,
-                                      d_attn_weights,
-                                      Config::enable_dropout_mask ? d_dropout_mask
-                                                                  : static_cast<DataType*>(nullptr),
-                                      dropout_p,
-                                      sqr_dk_scale,
-                                      d_grad_Q,
-                                      d_grad_K,
-                                      d_grad_V,
-                                      d_workspace,
-                                      d_cu_seqlens_q,
-                                      d_cu_seqlens_q_padded,
-                                      d_cu_seqlens_kv,
-                                      d_cu_seqlens_kv_padded);
-    }
+        bwd_launch();
     HIP_CHECK(hipEventRecord(stop));
     HIP_CHECK(hipEventSynchronize(stop));
 
@@ -1262,6 +1233,8 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipFree(d_cu_seqlens_q_padded));
     HIP_CHECK(hipFree(d_cu_seqlens_kv));
     HIP_CHECK(hipFree(d_cu_seqlens_kv_padded));
+    if(d_padded_q_to_batch)
+        HIP_CHECK(hipFree(d_padded_q_to_batch));
     HIP_CHECK(hipEventDestroy(start));
     HIP_CHECK(hipEventDestroy(stop));
 }
