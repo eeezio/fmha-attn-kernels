@@ -4,6 +4,7 @@
 #include <hip/hip_bfloat16.h>
 
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -1239,6 +1240,291 @@ void test_run_attn_bwd_kernel(
     HIP_CHECK(hipEventDestroy(stop));
 }
 
+/**
+ * Backward test with explicitly provided Q seqlens (for corner-case tests).
+ * KV seqlens are built inside (random per batch). Uses total_padded_q for all Q-side buffers.
+ */
+template <typename DataType, typename Config>
+void test_run_attn_bwd_with_seqlens(const std::vector<int>& h_cu_seqlens_q,
+                                    const std::vector<int>& h_cu_seqlens_q_padded,
+                                    const std::vector<int>& h_padded_q_to_batch,
+                                    int total_padded_q,
+                                    float dropout_p,
+                                    bool check_correctness,
+                                    bool dump_err,
+                                    const std::string& test_name)
+{
+    using Launcher = AttnBackwardKernelLauncher<DataType, Config>;
+
+    constexpr int head_num   = Config::head_num;
+    constexpr int max_seq_kv = Config::max_seq_kv;
+    constexpr int head_dim   = Config::head_dim;
+    int bs                   = static_cast<int>(h_cu_seqlens_q.size()) - 1;
+
+    std::mt19937 gen(123);
+    std::normal_distribution<float> normal_dis(4.0f, 2.0f);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    std::uniform_int_distribution<int> pad_dis(0, 5);
+
+    // Build cu_seqlens_kv / cu_seqlens_kv_padded
+    std::vector<int> h_cu_seqlens_kv(bs + 1);
+    std::vector<int> h_cu_seqlens_kv_padded(bs + 1);
+    h_cu_seqlens_kv[0]        = 0;
+    h_cu_seqlens_kv_padded[0] = 0;
+    int total_actual_kv_seq   = 0;
+    int total_padded_kv_seq   = 0;
+    for(int b = 0; b < bs; b++)
+    {
+        int kv_len     = static_cast<int>(std::round(normal_dis(gen)));
+        kv_len         = std::max(2, std::min(max_seq_kv, kv_len));
+        int random_pad = pad_dis(gen);
+        int padded_len = kv_len + random_pad > max_seq_kv ? max_seq_kv : kv_len + random_pad;
+        total_padded_kv_seq += padded_len;
+        total_actual_kv_seq += kv_len;
+        h_cu_seqlens_kv[b + 1]        = total_actual_kv_seq;
+        h_cu_seqlens_kv_padded[b + 1] = total_padded_kv_seq;
+    }
+
+    size_t size_Q            = (size_t)total_padded_q * head_num * head_dim;
+    size_t size_K            = (size_t)total_padded_kv_seq * head_num * head_dim;
+    size_t size_V            = size_K;
+    size_t size_grad_O       = size_Q;
+    size_t size_attn_weights = (size_t)total_padded_q * head_num * max_seq_kv;
+    size_t size_dropout_mask = size_attn_weights;
+
+    std::vector<DataType> h_Q(size_Q, DataType(0.0f)), h_K(size_K), h_V(size_K);
+    std::vector<DataType> h_grad_O(size_grad_O), h_attn_weights(size_attn_weights),
+        h_dropout_mask(size_dropout_mask, DataType(1.0f));
+    std::vector<DataType> h_grad_Q_gpu(size_Q), h_grad_K_gpu(size_K), h_grad_V_gpu(size_V);
+    std::vector<DataType> h_grad_Q_cpu(size_Q), h_grad_K_cpu(size_K), h_grad_V_cpu(size_V);
+
+    for(size_t i = 0; i < size_Q; i++)
+        h_Q[i] = DataType(dis(gen));
+    for(size_t i = 0; i < size_K; i++)
+        h_K[i] = DataType(dis(gen));
+    for(size_t i = 0; i < size_V; i++)
+        h_V[i] = DataType(dis(gen));
+    for(size_t i = 0; i < size_grad_O; i++)
+        h_grad_O[i] = DataType(dis(gen));
+    for(size_t i = 0; i < size_dropout_mask; i++)
+        h_dropout_mask[i] = Config::enable_dropout_mask
+                                ? DataType(dis(gen) > dropout_p ? 1.0f : 0.0f)
+                                : DataType(1.0f);
+
+    // Q and grad_O for active-Q batches only (by padded offset)
+    for(int b = 0; b < bs; b++)
+    {
+        int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
+        if(actual_q == 0)
+            continue;
+        int q_off = h_cu_seqlens_q_padded[b];
+        for(int h = 0; h < head_num; h++)
+        {
+            int base = (q_off * head_num + h) * head_dim;
+            for(int d = 0; d < head_dim; d++)
+            {
+                h_Q[base + d]      = DataType(dis(gen));
+                h_grad_O[base + d] = DataType(dis(gen));
+            }
+        }
+    }
+
+    // K/V
+    for(int b = 0; b < bs; b++)
+    {
+        int kv_seq = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
+        int kv_off = h_cu_seqlens_kv_padded[b];
+        for(int h = 0; h < head_num; h++)
+        {
+            for(int s = 0; s < kv_seq; s++)
+            {
+                int base = (kv_off + s) * head_num * head_dim + h * head_dim;
+                for(int d = 0; d < head_dim; d++)
+                {
+                    h_K[base + d] = DataType(dis(gen));
+                    h_V[base + d] = DataType(dis(gen));
+                }
+            }
+        }
+    }
+
+    // attn_weights: normalized per row for active-Q batches
+    for(int b = 0; b < bs; b++)
+    {
+        int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
+        if(actual_q == 0)
+            continue;
+        int kv_seq = h_cu_seqlens_kv[b + 1] - h_cu_seqlens_kv[b];
+        int q_off  = h_cu_seqlens_q_padded[b];
+        for(int h = 0; h < head_num; h++)
+        {
+            int base = (q_off * head_num + h) * max_seq_kv;
+            float sum = 0.0f;
+            for(int j = 0; j < kv_seq; j++)
+            {
+                h_attn_weights[base + j] = DataType(std::abs(dis(gen)));
+                sum += float(h_attn_weights[base + j]);
+            }
+            for(int j = kv_seq; j < max_seq_kv; j++)
+                h_attn_weights[base + j] = DataType(0.0f);
+            if(sum > 0.0f)
+                for(int j = 0; j < kv_seq; j++)
+                    h_attn_weights[base + j] =
+                        DataType(float(h_attn_weights[base + j]) / sum);
+        }
+    }
+
+    float sqr_dk_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if(check_correctness)
+        attn_backward(h_Q.data(),
+                      h_K.data(),
+                      h_V.data(),
+                      h_grad_O.data(),
+                      h_attn_weights.data(),
+                      Config::enable_dropout_mask ? h_dropout_mask.data() : nullptr,
+                      dropout_p,
+                      h_grad_Q_cpu.data(),
+                      h_grad_K_cpu.data(),
+                      h_grad_V_cpu.data(),
+                      bs,
+                      head_num,
+                      max_seq_kv,
+                      head_dim,
+                      Config::mask_type,
+                      h_cu_seqlens_q.data(),
+                      h_cu_seqlens_q_padded.data(),
+                      h_cu_seqlens_kv.data(),
+                      h_cu_seqlens_kv_padded.data(),
+                      total_padded_q,
+                      total_padded_kv_seq);
+
+    DataType *d_Q, *d_K, *d_V, *d_grad_O, *d_attn_weights, *d_dropout_mask;
+    DataType *d_grad_Q, *d_grad_K, *d_grad_V, *d_workspace;
+    int *d_cu_seqlens_q, *d_cu_seqlens_q_padded;
+    int *d_cu_seqlens_kv, *d_cu_seqlens_kv_padded;
+    int* d_padded_q_to_batch;
+
+    HIP_CHECK(hipMalloc(&d_Q, size_Q > 0 ? size_Q * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_K, size_K * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_V, size_V * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_O, size_grad_O > 0 ? size_grad_O * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_attn_weights,
+                        size_attn_weights > 0 ? size_attn_weights * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_dropout_mask,
+                        size_dropout_mask > 0 ? size_dropout_mask * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_grad_Q, size_Q > 0 ? size_Q * sizeof(DataType) : 1));
+    HIP_CHECK(hipMalloc(&d_grad_K, size_K * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_grad_V, size_V * sizeof(DataType)));
+    HIP_CHECK(hipMalloc(&d_cu_seqlens_q, (bs + 1) * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_cu_seqlens_q_padded, (bs + 1) * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_cu_seqlens_kv, (bs + 1) * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_cu_seqlens_kv_padded, (bs + 1) * sizeof(int)));
+    if(total_padded_q > 0)
+        HIP_CHECK(hipMalloc(&d_padded_q_to_batch, total_padded_q * sizeof(int)));
+    else
+        d_padded_q_to_batch = nullptr;
+
+    size_t workspace_size = Launcher::calc_workspace_size(total_padded_q);
+    HIP_CHECK(hipMalloc(&d_workspace, workspace_size > 0 ? workspace_size : 1));
+
+    HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), size_Q * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_K, h_K.data(), size_K * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_V, h_V.data(), size_V * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_grad_O, h_grad_O.data(),
+                        size_grad_O * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_attn_weights, h_attn_weights.data(),
+                        size_attn_weights * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_dropout_mask, h_dropout_mask.data(),
+                        size_dropout_mask * sizeof(DataType), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_cu_seqlens_q, h_cu_seqlens_q.data(),
+                        (bs + 1) * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_cu_seqlens_q_padded, h_cu_seqlens_q_padded.data(),
+                        (bs + 1) * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_cu_seqlens_kv, h_cu_seqlens_kv.data(),
+                        (bs + 1) * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_cu_seqlens_kv_padded, h_cu_seqlens_kv_padded.data(),
+                        (bs + 1) * sizeof(int), hipMemcpyHostToDevice));
+    if(total_padded_q > 0)
+        HIP_CHECK(hipMemcpy(d_padded_q_to_batch, h_padded_q_to_batch.data(),
+                            total_padded_q * sizeof(int), hipMemcpyHostToDevice));
+
+    // Zero workspace so padding rows (when Q padded > actual) are defined for softmax backward
+    if(workspace_size > 0)
+        HIP_CHECK(hipMemset(d_workspace, 0, workspace_size));
+
+    Launcher::run_attn_bwd_kernel(d_Q,
+                                  d_K,
+                                  d_V,
+                                  d_grad_O,
+                                  d_attn_weights,
+                                  Config::enable_dropout_mask ? d_dropout_mask : nullptr,
+                                  dropout_p,
+                                  sqr_dk_scale,
+                                  d_grad_Q,
+                                  d_grad_K,
+                                  d_grad_V,
+                                  d_workspace,
+                                  d_cu_seqlens_q,
+                                  d_cu_seqlens_q_padded,
+                                  d_cu_seqlens_kv,
+                                  d_cu_seqlens_kv_padded,
+                                  d_padded_q_to_batch,
+                                  total_padded_q);
+
+    HIP_CHECK(hipMemcpy(h_grad_Q_gpu.data(), d_grad_Q,
+                        size_Q * sizeof(DataType), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_grad_K_gpu.data(), d_grad_K,
+                        size_K * sizeof(DataType), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(h_grad_V_gpu.data(), d_grad_V,
+                        size_V * sizeof(DataType), hipMemcpyDeviceToHost));
+
+    if(check_correctness)
+    {
+        float max_diff = 0.0f, max_rel_diff = 0.0f;
+        size_t diff_count = 0;
+        for(int b = 0; b < bs; b++)
+        {
+            int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
+            if(actual_q == 0)
+                continue;
+            int q_off = h_cu_seqlens_q_padded[b];
+            for(int h = 0; h < head_num; h++)
+            {
+                for(int d = 0; d < head_dim; d++)
+                {
+                    size_t idx = (q_off * head_num + h) * head_dim + d;
+                    float diff     = std::abs(float(h_grad_Q_gpu[idx]) - float(h_grad_Q_cpu[idx]));
+                    float rel_diff = diff / (std::abs(float(h_grad_Q_cpu[idx])) + 1e-6f);
+                    max_diff       = std::max(max_diff, diff);
+                    max_rel_diff   = std::max(max_rel_diff, rel_diff);
+                    if(rel_diff > 1e-1f)
+                        diff_count++;
+                }
+            }
+        }
+        std::cout << test_name << " — grad_Q (active): max_abs_diff=" << max_diff
+                  << " max_rel_diff=" << max_rel_diff << " diff_count=" << diff_count
+                  << " " << (max_rel_diff < 1e-1f ? "PASS" : "FAIL") << std::endl;
+    }
+
+    HIP_CHECK(hipFree(d_Q));
+    HIP_CHECK(hipFree(d_K));
+    HIP_CHECK(hipFree(d_V));
+    HIP_CHECK(hipFree(d_grad_O));
+    HIP_CHECK(hipFree(d_attn_weights));
+    HIP_CHECK(hipFree(d_dropout_mask));
+    HIP_CHECK(hipFree(d_grad_Q));
+    HIP_CHECK(hipFree(d_grad_K));
+    HIP_CHECK(hipFree(d_grad_V));
+    HIP_CHECK(hipFree(d_workspace));
+    HIP_CHECK(hipFree(d_cu_seqlens_q));
+    HIP_CHECK(hipFree(d_cu_seqlens_q_padded));
+    HIP_CHECK(hipFree(d_cu_seqlens_kv));
+    HIP_CHECK(hipFree(d_cu_seqlens_kv_padded));
+    if(d_padded_q_to_batch)
+        HIP_CHECK(hipFree(d_padded_q_to_batch));
+}
+
 // Template metaprogramming: recursive template to iterate over SEQ_KV values
 template <int SEQ_KV, int MAX_SEQ_KV>
 struct TestRunner
@@ -1335,6 +1621,66 @@ int main(int argc, char const* argv[])
                                                  true, // check_correctness
                                                  true  // dump_err
     );
+
+    std::cout << "\n========== Corner: Empty segments in padding sense (bs=128) =========="
+              << std::endl;
+    // cu_seqlens_q = cu_seqlens_q_padded = [0,1,1,2,2,...,64,64]: even batches have 1 Q, odd have 0.
+    {
+        const int corner_bs = 128;
+        std::vector<int> h_cu_seqlens_q(corner_bs + 1);
+        std::vector<int> h_cu_seqlens_q_padded(corner_bs + 1);
+        std::vector<int> h_padded_q_to_batch(corner_bs / 2);
+        h_cu_seqlens_q[0]        = 0;
+        h_cu_seqlens_q_padded[0] = 0;
+        for(int b = 0; b < corner_bs; b++)
+        {
+            int actual = (b % 2 == 0) ? 1 : 0;
+            h_cu_seqlens_q[b + 1]        = h_cu_seqlens_q[b] + actual;
+            h_cu_seqlens_q_padded[b + 1] = h_cu_seqlens_q_padded[b] + actual;
+        }
+        int total_padded_q = h_cu_seqlens_q_padded[corner_bs];
+        for(int b = 0; b < corner_bs; b++)
+            if(h_cu_seqlens_q_padded[b + 1] > h_cu_seqlens_q_padded[b])
+                h_padded_q_to_batch[h_cu_seqlens_q_padded[b]] = b;
+
+        using CornerConfig = FmhaKernelConfig<128, 4, 8, 64, 256, false, CausalMaskType::DISABLE>;
+        test_run_attn_bwd_with_seqlens<float, CornerConfig>(h_cu_seqlens_q,
+                                                            h_cu_seqlens_q_padded,
+                                                            h_padded_q_to_batch,
+                                                            total_padded_q,
+                                                            0.0f,
+                                                            true,
+                                                            true,
+                                                            "Empty segments (padding sense)");
+    }
+
+    std::cout << "\n========== Corner: Q padded > actual (bs=128, 2 padded slots per batch) =========="
+              << std::endl;
+    // cu_seqlens_q = [0,1,...,128], cu_seqlens_q_padded = [0,2,4,...,256]; 1 actual Q, 2 padded per batch.
+    {
+        const int corner_bs = 128;
+        std::vector<int> h_cu_seqlens_q(corner_bs + 1);
+        std::vector<int> h_cu_seqlens_q_padded(corner_bs + 1);
+        std::vector<int> h_padded_q_to_batch(256);
+        for(int b = 0; b <= corner_bs; b++)
+        {
+            h_cu_seqlens_q[b]        = b;
+            h_cu_seqlens_q_padded[b] = b * 2;
+        }
+        for(int i = 0; i < 256; i++)
+            h_padded_q_to_batch[i] = i / 2;
+        int total_padded_q = 256;
+
+        using CornerConfig = FmhaKernelConfig<128, 4, 8, 64, 256, false, CausalMaskType::DISABLE>;
+        test_run_attn_bwd_with_seqlens<float, CornerConfig>(h_cu_seqlens_q,
+                                                            h_cu_seqlens_q_padded,
+                                                            h_padded_q_to_batch,
+                                                            total_padded_q,
+                                                            0.0f,
+                                                            true,
+                                                            true,
+                                                            "Q padded > actual");
+    }
 
     return 0;
 }
