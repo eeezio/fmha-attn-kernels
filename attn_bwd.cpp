@@ -1480,31 +1480,86 @@ void test_run_attn_bwd_with_seqlens(const std::vector<int>& h_cu_seqlens_q,
 
     if(check_correctness)
     {
-        float max_diff = 0.0f, max_rel_diff = 0.0f;
-        size_t diff_count = 0;
-        for(int b = 0; b < bs; b++)
-        {
-            int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
-            if(actual_q == 0)
-                continue;
-            int q_off = h_cu_seqlens_q_padded[b];
-            for(int h = 0; h < head_num; h++)
+        auto check_grad_q = [&](float tolerance = 1e-1f) {
+            float max_diff     = 0.0f;
+            float max_rel_diff = 0.0f;
+            size_t diff_count  = 0;
+            size_t active_elems = 0;
+
+            for(int b = 0; b < bs; b++)
             {
-                for(int d = 0; d < head_dim; d++)
+                int actual_q = h_cu_seqlens_q[b + 1] - h_cu_seqlens_q[b];
+                if(actual_q == 0)
+                    continue;
+                int q_off = h_cu_seqlens_q_padded[b];
+                for(int h = 0; h < head_num; h++)
                 {
-                    size_t idx = (q_off * head_num + h) * head_dim + d;
-                    float diff     = std::abs(float(h_grad_Q_gpu[idx]) - float(h_grad_Q_cpu[idx]));
-                    float rel_diff = diff / (std::abs(float(h_grad_Q_cpu[idx])) + 1e-6f);
-                    max_diff       = std::max(max_diff, diff);
-                    max_rel_diff   = std::max(max_rel_diff, rel_diff);
-                    if(rel_diff > 1e-1f)
-                        diff_count++;
+                    int base = (q_off * head_num + h) * head_dim;
+                    for(int d = 0; d < head_dim; d++)
+                    {
+                        size_t idx     = base + d;
+                        float diff     = std::abs(float(h_grad_Q_gpu[idx]) - float(h_grad_Q_cpu[idx]));
+                        float ref      = std::abs(float(h_grad_Q_cpu[idx])) + 1e-6f;
+                        float rel_diff = diff / ref;
+                        max_diff       = std::max(max_diff, diff);
+                        max_rel_diff   = std::max(max_rel_diff, rel_diff);
+                        if(rel_diff > tolerance)
+                        {
+                            if(dump_err)
+                                std::cout << "grad_Q mismatch at [b=" << b << ",h=" << h << ",d=" << d
+                                          << "]: GPU=" << static_cast<float>(h_grad_Q_gpu[idx])
+                                          << " CPU=" << static_cast<float>(h_grad_Q_cpu[idx])
+                                          << " rel=" << rel_diff << std::endl;
+                            diff_count++;
+                        }
+                        active_elems++;
+                    }
                 }
             }
-        }
-        std::cout << test_name << " — grad_Q (active): max_abs_diff=" << max_diff
-                  << " max_rel_diff=" << max_rel_diff << " diff_count=" << diff_count
-                  << " " << (max_rel_diff < 1e-1f ? "PASS" : "FAIL") << std::endl;
+            std::cout << "grad_Q check (active slots only):" << std::endl;
+            std::cout << "  Active Q elements: " << active_elems << std::endl;
+            std::cout << "  Max abs diff: " << max_diff << "  Max rel diff: " << max_rel_diff
+                      << std::endl;
+            std::cout << "  Exceeding tolerance: " << diff_count << " / " << active_elems << std::endl;
+            std::cout << "  Status: " << (max_rel_diff < tolerance ? "PASS" : "FAIL") << std::endl;
+        };
+
+        auto check_array = [&](const std::vector<DataType>& gpu,
+                               const std::vector<DataType>& cpu,
+                               const std::string& name,
+                               float tolerance = 1e-1f) {
+            float max_diff     = 0.0f;
+            float max_rel_diff = 0.0f;
+            size_t diff_count  = 0;
+            for(size_t i = 0; i < gpu.size(); i++)
+            {
+                float diff     = std::abs(float(gpu[i]) - float(cpu[i]));
+                float rel_diff = diff / (std::abs(float(cpu[i])) + 1e-6f);
+                max_diff       = std::max(max_diff, diff);
+                max_rel_diff   = std::max(max_rel_diff, rel_diff);
+                if(rel_diff > tolerance)
+                {
+                    if(dump_err)
+                        std::cout << name << " mismatch at " << i
+                                  << ": GPU=" << static_cast<float>(gpu[i])
+                                  << " CPU=" << static_cast<float>(cpu[i])
+                                  << " rel=" << rel_diff << std::endl;
+                    diff_count++;
+                }
+            }
+            std::cout << name << " check:" << std::endl;
+            std::cout << "  Max abs diff: " << max_diff << "  Max rel diff: " << max_rel_diff
+                      << std::endl;
+            std::cout << "  Exceeding tolerance: " << diff_count << " / " << gpu.size() << std::endl;
+            std::cout << "  Status: " << (max_rel_diff < tolerance ? "PASS" : "FAIL") << std::endl;
+        };
+
+        std::cout << "\n===== " << test_name << " =====" << std::endl;
+        std::cout << "Correctness:" << std::endl;
+        check_grad_q();
+        check_array(h_grad_K_gpu, h_grad_K_cpu, "grad_K");
+        check_array(h_grad_V_gpu, h_grad_V_cpu, "grad_V");
+        std::cout << std::endl;
     }
 
     HIP_CHECK(hipFree(d_Q));
